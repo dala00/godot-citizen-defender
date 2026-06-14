@@ -26,7 +26,7 @@ var rng := RandomNumberGenerator.new()
 var font: Font
 
 var citizens: Array = []
-var player := {"pos": SCREEN * 0.5}
+var player := {"pos": SCREEN * 0.5, "face": Vector2.DOWN}
 var killer := {}
 
 # 街路グリッド：建物ブロックを道で囲む
@@ -43,15 +43,64 @@ var elapsed := 0.0
 var game_over := false
 
 var sfx := {}   # 効果音キャッシュ（起動時にコード合成）
+var tex := {}   # キャラのスプライト（Blender 製・未インポート時は丸で代替）
 const DEBUG_AUTOPLAY := false   # スクショ撮影用の自動操作（撮影後 false に戻す）
 
 
 func _ready() -> void:
 	rng.randomize()
 	font = ThemeDB.fallback_font
+	_load_tex()
 	_build_sfx()
+	_start_bgm()
 	_build_city()
 	_reset()
+
+
+func _start_bgm() -> void:
+	var path := "res://assets/Urban_Atmosphere.mp3"
+	if not ResourceLoader.exists(path):
+		return
+	var stream = load(path)
+	if stream is AudioStreamMP3:
+		stream.loop = true   # ループ再生
+	var p := AudioStreamPlayer.new()
+	p.name = "BGM"
+	p.stream = stream
+	p.volume_db = -10.0   # SE が聞こえるよう控えめ
+	p.bus = "Master"
+	add_child(p)
+	p.play()
+
+
+func _load_tex() -> void:
+	for k in ["citizen", "killer", "player"]:
+		var path := "res://assets/%s.png" % k
+		if ResourceLoader.exists(path):
+			tex[k] = load(path)
+
+
+## スプライトを中心 pos に size 四方で描く。テクスチャが無ければ false。
+func _spr(key: String, pos: Vector2, size: float, rot := 0.0, mod := Color.WHITE) -> bool:
+	var t = tex.get(key)
+	if t == null:
+		return false
+	var s := Vector2(size, size)
+	if is_zero_approx(rot):
+		draw_texture_rect(t, Rect2(pos - s * 0.5, s), false, mod)
+	else:
+		# 中心 pos で回転（スプライトは鼻が上＝-Y 向きで作成）
+		draw_set_transform(pos, rot, Vector2.ONE)
+		draw_texture_rect(t, Rect2(-s * 0.5, s), false, mod)
+		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	return true
+
+
+## 向きベクトルからスプライト回転角（鼻=上=-Y を基準）
+func _face_rot(face: Vector2) -> float:
+	if face.length_squared() < 0.0001:
+		return 0.0
+	return face.angle() + PI * 0.5
 
 
 ## 建物グリッドを生成。道(ROAD幅)で全ブロックを囲み、周囲も道にする。
@@ -62,7 +111,7 @@ func _build_city() -> void:
 	h_roads.clear()
 	var bw := (SCREEN.x - ROAD * (COLS + 1)) / COLS
 	var bh := (SCREEN.y - ROAD * (ROWS + 1)) / ROWS
-	var palette := [Color(0.30, 0.32, 0.40), Color(0.38, 0.34, 0.30), Color(0.28, 0.36, 0.38)]
+	var palette := [Color(0.48, 0.52, 0.62), Color(0.60, 0.53, 0.45), Color(0.46, 0.58, 0.60)]
 	for cx in COLS:
 		for cy in ROWS:
 			var x := ROAD + cx * (bw + ROAD)
@@ -117,6 +166,7 @@ func _spawn_citizen(anywhere := false) -> void:
 		"state": "wander",   # wander / flee
 		"flash": 0.0,        # ダメージ表示用
 		"flee_time": 0.0,
+		"face": Vector2.DOWN,
 	}
 	if anywhere:
 		c.pos = _random_road_point()
@@ -193,6 +243,7 @@ func _update_citizens(dt: float) -> void:
 			# 助かった市民は建物を無視して最寄りの画面端へ一直線に退場
 			c.flee_time += dt
 			c.pos += c.vel * dt
+			c.face = c.vel.normalized()
 			if _is_off_screen(c.pos) or c.flee_time > 5.0:
 				to_remove.append(c)
 			continue
@@ -211,6 +262,8 @@ func _update_citizens(dt: float) -> void:
 			c.vel = _rand_dir() * CITIZEN_SPEED
 			c.dir_timer = rng.randf_range(0.4, 1.0)
 		c.pos = np
+		if c.vel.length() > 1.0:
+			c.face = c.vel.normalized()
 		# 画面内へ戻す（端で反射）
 		if c.pos.x < 20 or c.pos.x > SCREEN.x - 20:
 			c.vel.x = -c.vel.x
@@ -255,6 +308,9 @@ func _init_killer() -> void:
 		"land_pos": SCREEN * 0.5,
 		"blocked": false,
 		"stuck": 0.0,            # 建物で進めない時間
+		"face": Vector2.DOWN,
+		"air_total": 2.0,        # 今回のジャンプ滞空時間
+		"take_pos": Vector2(SCREEN.x * 0.5, 60),  # 離陸地点
 	}
 	# 着地点はどこかの市民の近くに（道の上へ補正）
 	if not citizens.is_empty():
@@ -291,6 +347,8 @@ func _start_jump(saved: bool, land_override = null) -> void:
 	killer.target = null
 	killer.state = "air"
 	killer.air_timer = _air_time()
+	killer.air_total = killer.air_timer
+	killer.take_pos = killer.pos   # 離陸地点
 	killer.stuck = 0.0
 	var lp: Vector2
 	if land_override != null:
@@ -348,6 +406,7 @@ func _update_killer(dt: float) -> void:
 				if killer.target == null:
 					return
 			var target = killer.target
+			killer.face = (target.pos - killer.pos).normalized()  # 標的の方を向く
 			killer.blocked = _player_is_blocking()
 			if killer.blocked:
 				# 困って立ち止まる（混乱が溜まる）
@@ -400,6 +459,7 @@ func _update_player(dt: float) -> void:
 		var to_mid: Vector2 = mid - player.pos
 		if to_mid.length() > 2.0:
 			player.pos = _move_axis(player.pos, to_mid.normalized() * PLAYER_SPEED * dt, PLAYER_RADIUS)
+			player.face = to_mid.normalized()
 		return
 	var dir := Vector2.ZERO
 	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A): dir.x -= 1
@@ -408,6 +468,7 @@ func _update_player(dt: float) -> void:
 	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S): dir.y += 1
 	if dir != Vector2.ZERO:
 		player.pos = _move_axis(player.pos, dir.normalized() * PLAYER_SPEED * dt, PLAYER_RADIUS)
+		player.face = dir.normalized()
 	player.pos.x = clamp(player.pos.x, PLAYER_RADIUS, SCREEN.x - PLAYER_RADIUS)
 	player.pos.y = clamp(player.pos.y, PLAYER_RADIUS, SCREEN.y - PLAYER_RADIUS)
 
@@ -459,12 +520,12 @@ func _draw() -> void:
 
 func _draw_city() -> void:
 	# 地面（道のアスファルト）
-	draw_rect(Rect2(Vector2.ZERO, SCREEN), Color(0.22, 0.23, 0.25))
+	draw_rect(Rect2(Vector2.ZERO, SCREEN), Color(0.40, 0.42, 0.45))
 	# 道のセンターライン（破線）
 	for cx in v_roads:
-		draw_dashed_line(Vector2(cx, 0), Vector2(cx, SCREEN.y), Color(0.9, 0.85, 0.5, 0.20), 2.0, 16.0)
+		draw_dashed_line(Vector2(cx, 0), Vector2(cx, SCREEN.y), Color(0.97, 0.92, 0.55, 0.35), 2.0, 16.0)
 	for cy in h_roads:
-		draw_dashed_line(Vector2(0, cy), Vector2(SCREEN.x, cy), Color(0.9, 0.85, 0.5, 0.20), 2.0, 16.0)
+		draw_dashed_line(Vector2(0, cy), Vector2(SCREEN.x, cy), Color(0.97, 0.92, 0.55, 0.35), 2.0, 16.0)
 	# 建物（歩行不可の障害物）。影＋本体＋屋上のふち
 	for i in buildings.size():
 		var r: Rect2 = buildings[i]
@@ -478,18 +539,24 @@ func _draw_city() -> void:
 
 
 func _draw_citizen(c: Dictionary) -> void:
-	var col := Color(0.75, 0.75, 0.78)
+	var targeted: bool = killer.target == c and killer.state == "stalk"
+	# 状態リング（足元）
 	if c.state == "flee":
-		col = Color(0.4, 0.9, 0.5)
-	elif killer.target == c and killer.state == "stalk":
-		col = Color(1.0, 0.85, 0.3)  # 狙われている
+		draw_circle(c.pos, CITIZEN_RADIUS + 5, Color(0.4, 1.0, 0.5, 0.85), false, 3.0)
+	elif targeted:
+		draw_circle(c.pos, CITIZEN_RADIUS + 5, Color(1.0, 0.85, 0.2, 0.9), false, 3.0)
+	# スプライト（無ければ丸）
+	if not _spr("citizen", c.pos, 44.0, _face_rot(c.face)):
+		var col := Color(0.75, 0.75, 0.78)
+		if c.state == "flee": col = Color(0.4, 0.9, 0.5)
+		elif targeted: col = Color(1.0, 0.85, 0.3)
+		draw_circle(c.pos, CITIZEN_RADIUS, col)
+	# 被弾フラッシュ
 	if c.flash > 0.0:
-		col = Color(1, 1, 1)
-	draw_circle(c.pos, CITIZEN_RADIUS, col)
-	draw_circle(c.pos, CITIZEN_RADIUS, Color(0, 0, 0, 0.4), false, 1.5)
+		draw_circle(c.pos, CITIZEN_RADIUS + 2, Color(1, 1, 1, clamp(c.flash * 2.0, 0.0, 0.7)))
 	# 狙われている市民の上に HP
-	if killer.target == c and killer.state == "stalk" and c.state == "wander":
-		_draw_hp_bar(c.pos + Vector2(-14, -CITIZEN_RADIUS - 10), 28.0, float(c.hp) / CITIZEN_HP)
+	if targeted and c.state == "wander":
+		_draw_hp_bar(c.pos + Vector2(-14, -CITIZEN_RADIUS - 14), 28.0, float(c.hp) / CITIZEN_HP)
 
 
 func _draw_hp_bar(pos: Vector2, w: float, ratio: float) -> void:
@@ -501,21 +568,50 @@ func _draw_hp_bar(pos: Vector2, w: float, ratio: float) -> void:
 	draw_rect(Rect2(pos, Vector2(w * ratio, 4)), col)
 
 
+## ジャンプ：離陸地点から上へ飛んで消え、着地地点へ落ちてくる
+func _draw_killer_jump() -> void:
+	var H := 240.0   # ジャンプの高さ
+	var base := 58.0
+	var take: Vector2 = killer.take_pos
+	var land: Vector2 = killer.land_pos
+	var total: float = killer.air_total
+	var t: float = clamp(1.0 - killer.air_timer / total, 0.0, 1.0)
+	var rot := _face_rot(killer.face)
+	# 着地予告リング（早めに出して着地点を知らせる）
+	var ring: float = lerp(48.0, KILLER_RADIUS + 6.0, t)
+	draw_arc(land, ring, 0, TAU, 40, Color(1, 0.2, 0.2, 0.85), 3.0)
+	draw_circle(land, 4, Color(1, 0.2, 0.2, 0.85))
+	if t < 0.5:
+		# 上昇：離陸地点から上へ、大きくなりながらフェードアウト
+		var a: float = t / 0.5
+		var hgt: float = (1.0 - pow(1.0 - a, 2.0)) * H
+		var scl: float = 1.0 + 0.45 * a
+		var al: float = 1.0 - smoothstep(0.6, 1.0, a)
+		draw_circle(take, KILLER_RADIUS * (1.0 - 0.7 * a), Color(0, 0, 0, 0.25 * (1.0 - a)))  # 影
+		var jp := take + Vector2(0, -hgt)
+		if not _spr("killer", jp, base * scl, rot, Color(1, 1, 1, al)):
+			draw_circle(jp, KILLER_RADIUS * scl, Color(0.85, 0.12, 0.12, al))
+	else:
+		# 落下：上空から着地地点へ、小さくなりながらフェードイン
+		var b: float = (t - 0.5) / 0.5
+		var hgt: float = pow(1.0 - b, 2.0) * H
+		var scl: float = 1.0 + 0.45 * (1.0 - b)
+		var al: float = smoothstep(0.0, 0.25, b)
+		draw_circle(land, KILLER_RADIUS * (0.4 + 0.6 * b), Color(0, 0, 0, 0.25 * b))  # 影
+		var jp := land + Vector2(0, -hgt)
+		if not _spr("killer", jp, base * scl, rot, Color(1, 1, 1, al)):
+			draw_circle(jp, KILLER_RADIUS * scl, Color(0.85, 0.12, 0.12, al))
+
+
 func _draw_killer() -> void:
 	if killer.state == "air":
-		# 着地予告リング
-		var t: float = 1.0 - killer.air_timer / _air_time()
-		var ring: float = lerp(50.0, KILLER_RADIUS + 6.0, t)
-		draw_arc(killer.land_pos, ring, 0, TAU, 40, Color(1, 0.2, 0.2, 0.9), 3.0)
-		draw_circle(killer.land_pos, 4, Color(1, 0.2, 0.2, 0.8))
-		# 上空の影（小さく）
-		draw_circle(killer.pos, KILLER_RADIUS * 0.5, Color(0, 0, 0, 0.2))
+		_draw_killer_jump()
 		return
-	# 通常
-	draw_circle(killer.pos, KILLER_RADIUS, Color(0.85, 0.12, 0.12))
-	draw_circle(killer.pos, KILLER_RADIUS, Color(0, 0, 0, 0.5), false, 2.0)
-	# 目印（凶器＝白い三角）
-	draw_circle(killer.pos + Vector2(0, -2), 3, Color(1, 1, 1, 0.9))
+	# 通常（スプライト or 丸）
+	if not _spr("killer", killer.pos, 58.0, _face_rot(killer.face)):
+		draw_circle(killer.pos, KILLER_RADIUS, Color(0.85, 0.12, 0.12))
+		draw_circle(killer.pos, KILLER_RADIUS, Color(0, 0, 0, 0.5), false, 2.0)
+		draw_circle(killer.pos + Vector2(0, -2), 3, Color(1, 1, 1, 0.9))
 	# 混乱表示
 	if killer.blocked:
 		var fr: float = killer.frustration / _frustration_max()
@@ -525,12 +621,14 @@ func _draw_killer() -> void:
 
 func _draw_player() -> void:
 	var blocking := not game_over and _player_is_blocking()
-	var col := Color(0.3, 0.6, 1.0)
-	draw_circle(player.pos, PLAYER_RADIUS, col)
-	draw_circle(player.pos, PLAYER_RADIUS, Color(1, 1, 1, 0.8), false, 2.0)
-	# 妨害中はシールド光
+	# 妨害中はシールド光（足元）
 	if blocking:
-		draw_arc(player.pos, PLAYER_RADIUS + 6, 0, TAU, 32, Color(0.4, 1, 0.5, 0.9), 3.0)
+		draw_circle(player.pos, PLAYER_RADIUS + 7, Color(0.4, 1, 0.5, 0.25))
+		draw_arc(player.pos, PLAYER_RADIUS + 7, 0, TAU, 32, Color(0.4, 1, 0.5, 0.95), 3.0)
+	# スプライト（無ければ丸）
+	if not _spr("player", player.pos, 54.0, _face_rot(player.face)):
+		draw_circle(player.pos, PLAYER_RADIUS, Color(0.3, 0.6, 1.0))
+		draw_circle(player.pos, PLAYER_RADIUS, Color(1, 1, 1, 0.8), false, 2.0)
 
 
 func _draw_ui() -> void:
