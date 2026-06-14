@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__godot__run_project",
+      "mcp__godot__stop_project",
+      "mcp__godot__get_debug_output",
+      "mcp__godot__save_scene",
+      "mcp__godot__get_godot_version",
+      "mcp__blender__execute_blender_code",
+      "mcp__blender__get_objects_summary",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git pull:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git restore:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(python:*)",
+      "Bash(touch:*)",
+      "PowerShell(Start-Sleep -Seconds *)"
+    ]
+  }
+}

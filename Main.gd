@@ -1,0 +1,534 @@
+extends Node2D
+## 殺人鬼から市民を守る 2D ゲーム（画像なし・即時描画版）
+## プレイヤーは殺人鬼と狙われている市民の間に割り込んで妨害する。
+## 妨害し続けると殺人鬼は混乱→大ジャンプして消え、別の場所に着地して新たな標的を狙う。
+
+const SCREEN := Vector2(1024, 640)
+const PLAY_MARGIN := 50.0  # 市民が画面外に出たと見なす余白
+
+# --- プレイヤー ---
+const PLAYER_SPEED := 270.0
+const PLAYER_RADIUS := 16.0
+
+# --- 市民 ---
+const TARGET_CITIZENS := 11
+const CITIZEN_SPEED := 38.0
+const CITIZEN_RADIUS := 11.0
+const CITIZEN_HP := 3
+const FLEE_SPEED := 180.0
+
+# --- 殺人鬼（基準値。難易度で変化）---
+const KILLER_RADIUS := 16.0
+const ATTACK_RANGE := 30.0
+const BLOCK_RADIUS := 36.0   # この距離内で線分上にいれば妨害成立
+
+var rng := RandomNumberGenerator.new()
+var font: Font
+
+var citizens: Array = []
+var player := {"pos": SCREEN * 0.5}
+var killer := {}
+
+# 街路グリッド：建物ブロックを道で囲む
+const COLS := 4
+const ROWS := 3
+const ROAD := 80.0           # 道幅（＝歩けるエリア）
+var buildings: Array = []    # Rect2（歩行不可の障害物）
+var building_colors: Array = []
+var v_roads: Array = []      # 縦道の中心x
+var h_roads: Array = []      # 横道の中心y
+
+var score := 0
+var elapsed := 0.0
+var game_over := false
+
+
+func _ready() -> void:
+	rng.randomize()
+	font = ThemeDB.fallback_font
+	_build_city()
+	_reset()
+
+
+## 建物グリッドを生成。道(ROAD幅)で全ブロックを囲み、周囲も道にする。
+func _build_city() -> void:
+	buildings.clear()
+	building_colors.clear()
+	v_roads.clear()
+	h_roads.clear()
+	var bw := (SCREEN.x - ROAD * (COLS + 1)) / COLS
+	var bh := (SCREEN.y - ROAD * (ROWS + 1)) / ROWS
+	var palette := [Color(0.30, 0.32, 0.40), Color(0.38, 0.34, 0.30), Color(0.28, 0.36, 0.38)]
+	for cx in COLS:
+		for cy in ROWS:
+			var x := ROAD + cx * (bw + ROAD)
+			var y := ROAD + cy * (bh + ROAD)
+			buildings.append(Rect2(x, y, bw, bh))
+			building_colors.append(palette[(cx + cy) % palette.size()])
+	# 道の中心線（縦 COLS+1 本、横 ROWS+1 本）
+	for i in COLS + 1:
+		v_roads.append(i * (bw + ROAD) + ROAD * 0.5)
+	for j in ROWS + 1:
+		h_roads.append(j * (bh + ROAD) + ROAD * 0.5)
+
+
+func _reset() -> void:
+	score = 0
+	elapsed = 0.0
+	game_over = false
+	player.pos = SCREEN * 0.5
+	citizens.clear()
+	for i in TARGET_CITIZENS:
+		_spawn_citizen(true)
+	_init_killer()
+
+
+# ----------------------------------------------------------------------------
+# 難易度（経過時間で逓増）
+# ----------------------------------------------------------------------------
+func _level() -> int:
+	return int(elapsed / 6.0)  # 6秒ごとに 1 段階
+
+func _killer_speed() -> float:
+	return 72.0 + _level() * 15.0
+
+func _attack_interval() -> float:
+	return max(0.35, 0.95 - _level() * 0.07)
+
+func _frustration_max() -> float:
+	return min(2.0, 1.2 + _level() * 0.1)  # 妨害してから諦めるまで（短め）
+
+func _air_time() -> float:
+	return max(1.1, 3.0 - _level() * 0.22)  # 早く戻ってくる
+
+
+# ----------------------------------------------------------------------------
+# 市民
+# ----------------------------------------------------------------------------
+func _spawn_citizen(anywhere := false) -> void:
+	var c := {
+		"hp": CITIZEN_HP,
+		"vel": Vector2.ZERO,
+		"dir_timer": rng.randf_range(0.6, 2.0),
+		"state": "wander",   # wander / flee
+		"flash": 0.0,        # ダメージ表示用
+		"flee_time": 0.0,
+	}
+	if anywhere:
+		c.pos = _random_road_point()
+	else:
+		# 画面端の道から入ってくる
+		var edge := rng.randi() % 4
+		match edge:
+			0: c.pos = Vector2(_pick(v_roads), -20)
+			1: c.pos = Vector2(_pick(v_roads), SCREEN.y + 20)
+			2: c.pos = Vector2(-20, _pick(h_roads))
+			3: c.pos = Vector2(SCREEN.x + 20, _pick(h_roads))
+	c.vel = _rand_dir() * CITIZEN_SPEED
+	citizens.append(c)
+
+
+func _rand_dir() -> Vector2:
+	var a := rng.randf_range(0, TAU)
+	return Vector2(cos(a), sin(a))
+
+
+func _pick(arr: Array):
+	return arr[rng.randi() % arr.size()]
+
+
+## 道の上のランダムな点を返す
+func _random_road_point() -> Vector2:
+	if rng.randf() < 0.5:
+		return Vector2(_pick(v_roads), rng.randf_range(20, SCREEN.y - 20))
+	return Vector2(rng.randf_range(20, SCREEN.x - 20), _pick(h_roads))
+
+
+## 軸ごとに建物（radiusぶん膨らませた矩形）と衝突解決して移動先を返す。
+## 壁ずりが効くよう X→Y の順に押し戻す。
+func _move_axis(pos: Vector2, delta: Vector2, radius: float) -> Vector2:
+	var p := pos
+	p.x += delta.x
+	for b in buildings:
+		var ex: Rect2 = (b as Rect2).grow(radius)
+		if ex.has_point(p):
+			if delta.x > 0.0:
+				p.x = ex.position.x - 0.01
+			elif delta.x < 0.0:
+				p.x = ex.position.x + ex.size.x + 0.01
+	p.y += delta.y
+	for b in buildings:
+		var ey: Rect2 = (b as Rect2).grow(radius)
+		if ey.has_point(p):
+			if delta.y > 0.0:
+				p.y = ey.position.y - 0.01
+			elif delta.y < 0.0:
+				p.y = ey.position.y + ey.size.y + 0.01
+	return p
+
+
+## 建物の中に居たら最寄りの縦道へスナップして道の上に出す
+func _ensure_walkable(p: Vector2, radius: float) -> Vector2:
+	for b in buildings:
+		if (b as Rect2).grow(radius).has_point(p):
+			var best: float = v_roads[0]
+			for vx in v_roads:
+				if abs(vx - p.x) < abs(best - p.x):
+					best = vx
+			p.x = best
+			break
+	return p
+
+
+func _update_citizens(dt: float) -> void:
+	var to_remove: Array = []
+	for c in citizens:
+		if c.flash > 0.0:
+			c.flash -= dt
+		if c.state == "flee":
+			# 助かった市民は建物を無視して最寄りの画面端へ一直線に退場
+			c.flee_time += dt
+			c.pos += c.vel * dt
+			if _is_off_screen(c.pos) or c.flee_time > 5.0:
+				to_remove.append(c)
+			continue
+		# うろうろ
+		c.dir_timer -= dt
+		if c.dir_timer <= 0.0:
+			c.dir_timer = rng.randf_range(0.8, 2.4)
+			if rng.randf() < 0.25:
+				c.vel = Vector2.ZERO  # 立ち止まる
+			else:
+				c.vel = _rand_dir() * CITIZEN_SPEED
+		var want: Vector2 = c.vel * dt
+		var np: Vector2 = _move_axis(c.pos, want, CITIZEN_RADIUS)
+		# 壁にぶつかって進めなかったら向き直す
+		if want.length() > 0.1 and np.distance_to(c.pos) < want.length() * 0.5:
+			c.vel = _rand_dir() * CITIZEN_SPEED
+			c.dir_timer = rng.randf_range(0.4, 1.0)
+		c.pos = np
+		# 画面内へ戻す（端で反射）
+		if c.pos.x < 20 or c.pos.x > SCREEN.x - 20:
+			c.vel.x = -c.vel.x
+			c.pos.x = clamp(c.pos.x, 20, SCREEN.x - 20)
+		if c.pos.y < 20 or c.pos.y > SCREEN.y - 20:
+			c.vel.y = -c.vel.y
+			c.pos.y = clamp(c.pos.y, 20, SCREEN.y - 20)
+		# 殺人鬼と重ならないよう押し出す（空中時は除く）
+		if killer.state != "air":
+			var d: Vector2 = c.pos - killer.pos
+			var dl := d.length()
+			var min_d := CITIZEN_RADIUS + KILLER_RADIUS
+			if dl > 0.01 and dl < min_d:
+				var desired: Vector2 = killer.pos + d / dl * min_d
+				c.pos = _move_axis(c.pos, desired - c.pos, CITIZEN_RADIUS)
+
+	for c in to_remove:
+		if killer.get("target") == c:
+			killer.target = null
+		citizens.erase(c)
+
+	while citizens.size() < TARGET_CITIZENS:
+		_spawn_citizen(false)
+
+
+func _is_off_screen(p: Vector2) -> bool:
+	return p.x < -PLAY_MARGIN or p.x > SCREEN.x + PLAY_MARGIN \
+		or p.y < -PLAY_MARGIN or p.y > SCREEN.y + PLAY_MARGIN
+
+
+# ----------------------------------------------------------------------------
+# 殺人鬼
+# ----------------------------------------------------------------------------
+func _init_killer() -> void:
+	killer = {
+		"pos": Vector2(SCREEN.x * 0.5, 60),
+		"state": "air",          # stalk / air。開幕はジャンプ着地で登場
+		"target": null,
+		"attack_timer": 0.0,
+		"frustration": 0.0,
+		"air_timer": 2.0,        # 開幕の猶予
+		"land_pos": SCREEN * 0.5,
+		"blocked": false,
+		"stuck": 0.0,            # 建物で進めない時間
+	}
+	# 着地点はどこかの市民の近くに（道の上へ補正）
+	if not citizens.is_empty():
+		var c = citizens[rng.randi() % citizens.size()]
+		killer.land_pos = _ensure_walkable(c.pos, KILLER_RADIUS)
+
+
+func _pick_target() -> void:
+	var candidates := citizens.filter(func(c): return c.state == "wander")
+	if candidates.is_empty():
+		killer.target = null
+		return
+	# 近いほど狙われやすい
+	candidates.sort_custom(func(a, b):
+		return killer.pos.distance_squared_to(a.pos) < killer.pos.distance_squared_to(b.pos))
+	# 近い数体からランダムに
+	var n: int = min(3, candidates.size())
+	killer.target = candidates[rng.randi() % n]
+	killer.attack_timer = _attack_interval()
+	killer.frustration = 0.0
+
+
+func _start_jump(saved: bool, land_override = null) -> void:
+	if saved and killer.target != null:
+		# 助かった市民は喜んで逃げる
+		var t = killer.target
+		t.state = "flee"
+		var edge := _nearest_edge_dir(t.pos)
+		t.vel = edge * FLEE_SPEED
+		score += 1
+	killer.target = null
+	killer.state = "air"
+	killer.air_timer = _air_time()
+	killer.stuck = 0.0
+	var lp: Vector2
+	if land_override != null:
+		lp = land_override
+	elif citizens.is_empty():
+		lp = Vector2(rng.randf_range(120, SCREEN.x - 120), rng.randf_range(120, SCREEN.y - 120))
+	else:
+		var c = citizens[rng.randi() % citizens.size()]
+		lp = c.pos + _rand_dir() * rng.randf_range(40, 120)
+	lp.x = clamp(lp.x, 60, SCREEN.x - 60)
+	lp.y = clamp(lp.y, 60, SCREEN.y - 60)
+	killer.land_pos = _ensure_walkable(lp, KILLER_RADIUS)  # 建物の上に降りない
+
+
+func _nearest_edge_dir(p: Vector2) -> Vector2:
+	# 最も近い画面端へ向かう単位ベクトル
+	var d_left := p.x
+	var d_right := SCREEN.x - p.x
+	var d_top := p.y
+	var d_bot := SCREEN.y - p.y
+	var m: float = min(d_left, d_right, d_top, d_bot)
+	if m == d_left: return Vector2.LEFT
+	if m == d_right: return Vector2.RIGHT
+	if m == d_top: return Vector2.UP
+	return Vector2.DOWN
+
+
+func _player_is_blocking() -> bool:
+	if killer.target == null:
+		return false
+	var m: Vector2 = killer.pos
+	var t: Vector2 = killer.target.pos
+	var seg := t - m
+	var len2 := seg.length_squared()
+	if len2 < 1.0:
+		return false
+	var u: float = clamp((player.pos - m).dot(seg) / len2, 0.0, 1.0)
+	var proj := m + seg * u
+	return player.pos.distance_to(proj) < BLOCK_RADIUS and u > 0.12 and u < 0.95
+
+
+func _update_killer(dt: float) -> void:
+	match killer.state:
+		"air":
+			killer.air_timer -= dt
+			if killer.air_timer <= 0.0:
+				killer.pos = killer.land_pos
+				killer.state = "stalk"
+				_pick_target()
+		"stalk":
+			# 標的が無効なら選び直し
+			if killer.target == null or not citizens.has(killer.target) \
+					or killer.target.state == "flee":
+				_pick_target()
+				if killer.target == null:
+					return
+			var target = killer.target
+			killer.blocked = _player_is_blocking()
+			if killer.blocked:
+				# 困って立ち止まる（混乱が溜まる）
+				killer.frustration += dt
+				if killer.frustration >= _frustration_max():
+					_start_jump(true)  # 諦めてジャンプ＝救助成功
+			else:
+				killer.frustration = max(0.0, killer.frustration - dt * 0.6)
+				var to_t: Vector2 = target.pos - killer.pos
+				var dist := to_t.length()
+				if dist > ATTACK_RANGE:
+					var step := to_t.normalized() * _killer_speed() * dt
+					var np := _move_axis(killer.pos, step, KILLER_RADIUS)
+					var moved := np.distance_to(killer.pos)
+					killer.pos = np
+					# 建物に阻まれて進めない → 飛び越える（標的の近くへ着地）
+					if moved < step.length() * 0.5:
+						killer.stuck += dt
+						if killer.stuck > 0.8:
+							_start_jump(false, target.pos)
+					else:
+						killer.stuck = 0.0
+				else:
+					killer.stuck = 0.0
+					# 攻撃
+					killer.attack_timer -= dt
+					if killer.attack_timer <= 0.0:
+						killer.attack_timer = _attack_interval()
+						target.hp -= 1
+						target.flash = 0.25
+						if target.hp <= 0:
+							_trigger_game_over()
+
+
+func _trigger_game_over() -> void:
+	game_over = true
+
+
+# ----------------------------------------------------------------------------
+# プレイヤー入力
+# ----------------------------------------------------------------------------
+func _update_player(dt: float) -> void:
+	var dir := Vector2.ZERO
+	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A): dir.x -= 1
+	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D): dir.x += 1
+	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W): dir.y -= 1
+	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S): dir.y += 1
+	if dir != Vector2.ZERO:
+		player.pos = _move_axis(player.pos, dir.normalized() * PLAYER_SPEED * dt, PLAYER_RADIUS)
+	player.pos.x = clamp(player.pos.x, PLAYER_RADIUS, SCREEN.x - PLAYER_RADIUS)
+	player.pos.y = clamp(player.pos.y, PLAYER_RADIUS, SCREEN.y - PLAYER_RADIUS)
+
+
+# ----------------------------------------------------------------------------
+# メインループ
+# ----------------------------------------------------------------------------
+func _process(dt: float) -> void:
+	if game_over:
+		if Input.is_key_pressed(KEY_SPACE) or Input.is_key_pressed(KEY_ENTER):
+			_reset()
+		queue_redraw()
+		return
+	elapsed += dt
+	_update_player(dt)
+	_update_citizens(dt)
+	_update_killer(dt)
+	queue_redraw()
+
+
+# ----------------------------------------------------------------------------
+# 描画
+# ----------------------------------------------------------------------------
+func _draw() -> void:
+	_draw_city()
+	# 妨害ライン（殺人鬼→標的）
+	if not game_over and killer.state == "stalk" and killer.target != null:
+		var col := Color(1, 0.3, 0.2, 0.35)
+		if killer.blocked:
+			col = Color(0.3, 1, 0.4, 0.7)
+		draw_line(killer.pos, killer.target.pos, col, 3.0)
+
+	# 市民
+	for c in citizens:
+		_draw_citizen(c)
+
+	# 殺人鬼
+	_draw_killer()
+
+	# プレイヤー
+	_draw_player()
+
+	# UI
+	_draw_ui()
+
+	if game_over:
+		_draw_gameover()
+
+
+func _draw_city() -> void:
+	# 地面（道のアスファルト）
+	draw_rect(Rect2(Vector2.ZERO, SCREEN), Color(0.22, 0.23, 0.25))
+	# 道のセンターライン（破線）
+	for cx in v_roads:
+		draw_dashed_line(Vector2(cx, 0), Vector2(cx, SCREEN.y), Color(0.9, 0.85, 0.5, 0.20), 2.0, 16.0)
+	for cy in h_roads:
+		draw_dashed_line(Vector2(0, cy), Vector2(SCREEN.x, cy), Color(0.9, 0.85, 0.5, 0.20), 2.0, 16.0)
+	# 建物（歩行不可の障害物）。影＋本体＋屋上のふち
+	for i in buildings.size():
+		var r: Rect2 = buildings[i]
+		draw_rect(Rect2(r.position + Vector2(4, 4), r.size), Color(0, 0, 0, 0.35))  # 影
+		draw_rect(r, building_colors[i])
+		draw_rect(r, Color(0, 0, 0, 0.5), false, 2.0)
+		# 屋上にハッチ（歩けない感）
+		var inset := r.grow(-8.0)
+		if inset.size.x > 0 and inset.size.y > 0:
+			draw_rect(inset, Color(1, 1, 1, 0.05))
+
+
+func _draw_citizen(c: Dictionary) -> void:
+	var col := Color(0.75, 0.75, 0.78)
+	if c.state == "flee":
+		col = Color(0.4, 0.9, 0.5)
+	elif killer.target == c and killer.state == "stalk":
+		col = Color(1.0, 0.85, 0.3)  # 狙われている
+	if c.flash > 0.0:
+		col = Color(1, 1, 1)
+	draw_circle(c.pos, CITIZEN_RADIUS, col)
+	draw_circle(c.pos, CITIZEN_RADIUS, Color(0, 0, 0, 0.4), false, 1.5)
+	# 狙われている市民の上に HP
+	if killer.target == c and killer.state == "stalk" and c.state == "wander":
+		_draw_hp_bar(c.pos + Vector2(-14, -CITIZEN_RADIUS - 10), 28.0, float(c.hp) / CITIZEN_HP)
+
+
+func _draw_hp_bar(pos: Vector2, w: float, ratio: float) -> void:
+	draw_rect(Rect2(pos, Vector2(w, 4)), Color(0, 0, 0, 0.6))
+	var col := Color(0.3, 0.9, 0.3) if ratio > 0.5 else Color(0.95, 0.7, 0.2)
+	if ratio <= 0.34:
+		col = Color(0.95, 0.3, 0.25)
+	draw_rect(Rect2(pos, Vector2(w * ratio, 4)), col)
+
+
+func _draw_killer() -> void:
+	if killer.state == "air":
+		# 着地予告リング
+		var t: float = 1.0 - killer.air_timer / _air_time()
+		var ring: float = lerp(50.0, KILLER_RADIUS + 6.0, t)
+		draw_arc(killer.land_pos, ring, 0, TAU, 40, Color(1, 0.2, 0.2, 0.9), 3.0)
+		draw_circle(killer.land_pos, 4, Color(1, 0.2, 0.2, 0.8))
+		# 上空の影（小さく）
+		draw_circle(killer.pos, KILLER_RADIUS * 0.5, Color(0, 0, 0, 0.2))
+		return
+	# 通常
+	draw_circle(killer.pos, KILLER_RADIUS, Color(0.85, 0.12, 0.12))
+	draw_circle(killer.pos, KILLER_RADIUS, Color(0, 0, 0, 0.5), false, 2.0)
+	# 目印（凶器＝白い三角）
+	draw_circle(killer.pos + Vector2(0, -2), 3, Color(1, 1, 1, 0.9))
+	# 混乱表示
+	if killer.blocked:
+		var fr: float = killer.frustration / _frustration_max()
+		draw_string(font, killer.pos + Vector2(-8, -KILLER_RADIUS - 8), "!?", HORIZONTAL_ALIGNMENT_LEFT, -1, 18, Color(1, 1, 0.3))
+		_draw_hp_bar(killer.pos + Vector2(-16, -KILLER_RADIUS - 6), 32.0, fr)
+
+
+func _draw_player() -> void:
+	var blocking := not game_over and _player_is_blocking()
+	var col := Color(0.3, 0.6, 1.0)
+	draw_circle(player.pos, PLAYER_RADIUS, col)
+	draw_circle(player.pos, PLAYER_RADIUS, Color(1, 1, 1, 0.8), false, 2.0)
+	# 妨害中はシールド光
+	if blocking:
+		draw_arc(player.pos, PLAYER_RADIUS + 6, 0, TAU, 32, Color(0.4, 1, 0.5, 0.9), 3.0)
+
+
+func _draw_ui() -> void:
+	draw_string(font, Vector2(16, 30), "助けた人数: %d" % score, HORIZONTAL_ALIGNMENT_LEFT, -1, 22, Color(1, 1, 1))
+	draw_string(font, Vector2(16, 56), "経過: %ds   難易度 Lv.%d" % [int(elapsed), _level() + 1], HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color(0.85, 0.85, 0.9))
+	var hint := "矢印/WASDで移動 ・ 殺人鬼(赤)と狙われた市民(黄)の間に入って守れ！"
+	draw_string(font, Vector2(16, SCREEN.y - 14), hint, HORIZONTAL_ALIGNMENT_LEFT, -1, 14, Color(0.8, 0.8, 0.85))
+
+
+func _draw_gameover() -> void:
+	draw_rect(Rect2(Vector2.ZERO, SCREEN), Color(0, 0, 0, 0.6))
+	var c := SCREEN * 0.5
+	_draw_center_text("GAME OVER", c + Vector2(0, -40), 48, Color(1, 0.3, 0.3))
+	_draw_center_text("助けた人数: %d 人" % score, c + Vector2(0, 10), 28, Color(1, 1, 1))
+	_draw_center_text("スペース / Enter でリスタート", c + Vector2(0, 60), 18, Color(0.8, 0.8, 0.8))
+
+
+func _draw_center_text(text: String, center: Vector2, size: int, col: Color) -> void:
+	var w := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
+	draw_string(font, center - Vector2(w * 0.5, 0), text, HORIZONTAL_ALIGNMENT_LEFT, -1, size, col)
