@@ -40,4 +40,5 @@
 ## クレジット
 
 - BGM: 「Urban Atmosphere」 by FLASH☆BEAT （[DOVA-SYNDROME](https://dova-s.jp/bgm/detail/23466)）
+  - ※ 再配布不可のため `assets/Urban_Atmosphere.mp3` はリポジトリに含めていません。上記から入手し `assets/` に置いてください（無い場合は BGM 無しで動作します）。
 - フォント: [Sawarabi Gothic](https://github.com/google/fonts/tree/main/ofl/sawarabigothic)（SIL Open Font License 1.1 / `fonts/OFL.txt`）

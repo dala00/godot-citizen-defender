@@ -9,3 +9,7 @@ _shot.png
 
 # フォント原本（大きいので非管理。tools/subset_font.py が再取得方法を記載）
 fonts/_src/
+
+# BGM（DOVA-SYNDROME 素材。再配布不可のため Git 管理外。各自 assets/ に配置）
+assets/Urban_Atmosphere.mp3
+assets/Urban_Atmosphere.mp3.import
