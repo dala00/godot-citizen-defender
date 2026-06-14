@@ -26,10 +26,18 @@
 - `assets/` … キャラのスプライト（Blender 製）と BGM
 - `resource/` … README 用スクショなど（Godot の取り込み対象外）
 
-## 実行
+## 実行 / Web書き出し
 
-Godot 4.6 でプロジェクトを開いて実行（F5）。メインシーンは `Main.tscn`。
+- デスクトップ：Godot 4.6 でプロジェクトを開いて実行（F5）。メインシーンは `Main.tscn`。
+- Web(HTML5)：CLI で再書き出しできる。
+  ```
+  Godot_v4.6.3_console.exe --headless --path . --export-release "Web" exports/citizen-defender.html
+  ```
+  - 日本語は `fonts/SawarabiGothic.ttf`（OFL・使用文字にサブセット化）を同梱。文字を増やしたら `python tools/subset_font.py` で再生成する。
+  - BGM はブラウザの自動再生制限のため、Web では最初のクリック/キー入力で開始する。
+  - `exports/` のビルド成果物は Git 管理外。
 
 ## クレジット
 
 - BGM: 「Urban Atmosphere」 by FLASH☆BEAT （[DOVA-SYNDROME](https://dova-s.jp/bgm/detail/23466)）
+- フォント: [Sawarabi Gothic](https://github.com/google/fonts/tree/main/ofl/sawarabigothic)（SIL Open Font License 1.1 / `fonts/OFL.txt`）

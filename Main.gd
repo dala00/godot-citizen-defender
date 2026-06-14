@@ -44,12 +44,14 @@ var game_over := false
 
 var sfx := {}   # 効果音キャッシュ（起動時にコード合成）
 var tex := {}   # キャラのスプライト（Blender 製・未インポート時は丸で代替）
+var bgm_player: AudioStreamPlayer
+var bgm_started := false
 const DEBUG_AUTOPLAY := false   # スクショ撮影用の自動操作（撮影後 false に戻す）
 
 
 func _ready() -> void:
 	rng.randomize()
-	font = ThemeDB.fallback_font
+	font = _load_font()
 	_load_tex()
 	_build_sfx()
 	_start_bgm()
@@ -68,9 +70,33 @@ func _start_bgm() -> void:
 	p.name = "BGM"
 	p.stream = stream
 	p.volume_db = -10.0   # SE が聞こえるよう控えめ
-	p.bus = "Master"
 	add_child(p)
-	p.play()
+	bgm_player = p
+	# ブラウザはユーザー操作前の play() を無視する。Web は初回操作で開始。
+	if not OS.has_feature("web"):
+		p.play()
+		bgm_started = true
+
+
+func _input(event: InputEvent) -> void:
+	# Web 用：最初のクリック/キー入力で BGM を開始
+	if bgm_started or bgm_player == null:
+		return
+	var act: bool = (event is InputEventMouseButton and event.pressed) \
+		or (event is InputEventKey and event.pressed)
+	if act:
+		bgm_player.play()
+		bgm_started = true
+
+
+## 同梱の日本語フォント（サブセット）。Web では OS フォントが無いので必須。
+func _load_font() -> Font:
+	var path := "res://fonts/SawarabiGothic.ttf"
+	if ResourceLoader.exists(path):
+		var f = load(path)
+		if f is Font:
+			return f
+	return ThemeDB.fallback_font
 
 
 func _load_tex() -> void:

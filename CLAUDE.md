@@ -35,6 +35,14 @@
 - **新規 png/mp3 はエディタを前面化すると自動インポート**される（`.import` が生成されるまで実行ゲームの `load()` は失敗）。
 - スクショ用にプレイヤー自動操作 `DEBUG_AUTOPLAY`（撮影後は必ず `false` に戻す）。
 
+## Web 書き出し（[[godot-web-export]]）
+
+- **フォントは同梱必須**：`SystemFont` は Web で豆腐になる。`fonts/SawarabiGothic.ttf`（OFL を使用文字＋ASCIIにサブセット化、約87KB）を `_load_font()` で `load()`。**テキストを増やしたら `python tools/subset_font.py` を再実行**（`.gd` を走査して生成）。原本 `fonts/_src/`（1.9MB）は gitignore＆export 除外。
+- **BGM 自動再生制限**：`_start_bgm()` は `OS.has_feature("web")` 時は鳴らさず、`_input()` の初回クリック/キーで `play()`（`bgm_started` フラグ）。デスクトップは即再生。
+- リソースは `FileAccess` 生読みせず `load()`（フォント・mp3・png すべて）。
+- 表示は `canvas_items` ＋ aspect=keep（既定）で解像度非依存。
+- 再書き出し：`Godot..._console.exe --headless --path . --export-release "Web" exports/citizen-defender.html`。preset 名は `Web`、`export_presets.cfg` の `exclude_filter` で `fonts/_src/*,resource/*` を除外。`exports/` は成果物 gitignore（`.gdignore` で Godot 取り込みも除外）。
+
 ## Git
 
 - リモート `origin`（GitHub, SSH）。`main` で作業。キリのいいところでコミット&プッシュしてよい。
