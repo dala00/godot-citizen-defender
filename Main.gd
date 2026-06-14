@@ -42,10 +42,14 @@ var score := 0
 var elapsed := 0.0
 var game_over := false
 
+var sfx := {}   # 効果音キャッシュ（起動時にコード合成）
+const DEBUG_AUTOPLAY := false   # スクショ撮影用の自動操作（撮影後 false に戻す）
+
 
 func _ready() -> void:
 	rng.randomize()
 	font = ThemeDB.fallback_font
+	_build_sfx()
 	_build_city()
 	_reset()
 
@@ -281,6 +285,9 @@ func _start_jump(saved: bool, land_override = null) -> void:
 		var edge := _nearest_edge_dir(t.pos)
 		t.vel = edge * FLEE_SPEED
 		score += 1
+		_play("rescue")
+	else:
+		_play("jump")
 	killer.target = null
 	killer.state = "air"
 	killer.air_timer = _air_time()
@@ -371,18 +378,29 @@ func _update_killer(dt: float) -> void:
 						killer.attack_timer = _attack_interval()
 						target.hp -= 1
 						target.flash = 0.25
+						_play("attack", rng.randf_range(0.94, 1.08))
 						if target.hp <= 0:
 							_trigger_game_over()
 
 
 func _trigger_game_over() -> void:
+	if DEBUG_AUTOPLAY:
+		return  # スクショ撮影中は死なない
 	game_over = true
+	_play("gameover")
 
 
 # ----------------------------------------------------------------------------
 # プレイヤー入力
 # ----------------------------------------------------------------------------
 func _update_player(dt: float) -> void:
+	if DEBUG_AUTOPLAY and killer.state == "stalk" and killer.target != null:
+		# スクショ用：殺人鬼と標的の間に張り付く
+		var mid: Vector2 = (killer.pos + killer.target.pos) * 0.5
+		var to_mid: Vector2 = mid - player.pos
+		if to_mid.length() > 2.0:
+			player.pos = _move_axis(player.pos, to_mid.normalized() * PLAYER_SPEED * dt, PLAYER_RADIUS)
+		return
 	var dir := Vector2.ZERO
 	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A): dir.x -= 1
 	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D): dir.x += 1
@@ -475,6 +493,7 @@ func _draw_citizen(c: Dictionary) -> void:
 
 
 func _draw_hp_bar(pos: Vector2, w: float, ratio: float) -> void:
+	ratio = clamp(ratio, 0.0, 1.0)
 	draw_rect(Rect2(pos, Vector2(w, 4)), Color(0, 0, 0, 0.6))
 	var col := Color(0.3, 0.9, 0.3) if ratio > 0.5 else Color(0.95, 0.7, 0.2)
 	if ratio <= 0.34:
@@ -532,3 +551,78 @@ func _draw_gameover() -> void:
 func _draw_center_text(text: String, center: Vector2, size: int, col: Color) -> void:
 	var w := font.get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, size).x
 	draw_string(font, center - Vector2(w * 0.5, 0), text, HORIZONTAL_ALIGNMENT_LEFT, -1, size, col)
+
+
+# ----------------------------------------------------------------------------
+# 効果音（PCM をコード合成。アセット0）
+# ----------------------------------------------------------------------------
+const SR := 22050
+
+func _build_sfx() -> void:
+	# 攻撃：低い square の刺すような一発
+	sfx["attack"] = _make_sfx([{"freq": 150.0, "freq2": 90.0, "wave": "square", "dur": 0.08, "vol": 0.45, "env": "decay"}])
+	# 救助：tri で明るい上昇2音
+	sfx["rescue"] = _make_sfx([
+		{"freq": 523.0, "wave": "tri", "dur": 0.09, "vol": 0.5, "env": "attackdecay"},
+		{"freq": 784.0, "wave": "tri", "dur": 0.13, "vol": 0.5, "env": "attackdecay"},
+	])
+	# ジャンプ：saw を上昇スイープする whoosh
+	sfx["jump"] = _make_sfx([{"freq": 220.0, "freq2": 760.0, "wave": "saw", "dur": 0.18, "vol": 0.35, "env": "decay"}])
+	# ゲームオーバー：下降スイープ＋ノイズの爆発
+	sfx["gameover"] = _make_sfx([
+		{"freq": 420.0, "freq2": 60.0, "wave": "saw", "dur": 0.45, "vol": 0.5, "env": "decay"},
+		{"freq": 0.0, "wave": "noise", "dur": 0.3, "vol": 0.4, "env": "decay"},
+	])
+
+
+func _osc(wave: String, phase: float) -> float:
+	match wave:
+		"square": return 1.0 if fmod(phase, 1.0) < 0.5 else -1.0
+		"tri": return 4.0 * abs(fmod(phase, 1.0) - 0.5) - 1.0
+		"saw": return 2.0 * fmod(phase, 1.0) - 1.0
+		"noise": return rng.randf_range(-1.0, 1.0)
+		_: return sin(phase * TAU)
+
+
+## セグメント列を繋いで AudioStreamWAV(16bit/mono) を合成
+func _make_sfx(segments: Array) -> AudioStreamWAV:
+	var data := PackedByteArray()
+	var phase := 0.0
+	for seg in segments:
+		var dur: float = seg.get("dur", 0.1)
+		var n: int = int(SR * dur)
+		var f1: float = seg.get("freq", 440.0)
+		var f2: float = seg.get("freq2", f1)
+		var wave: String = seg.get("wave", "sine")
+		var vol: float = seg.get("vol", 0.6)
+		var env: String = seg.get("env", "decay")
+		for i in n:
+			var t: float = float(i) / float(max(1, n))
+			var freq: float = lerp(f1, f2, t)
+			phase += freq / SR  # 位相は累積で進めて繋ぎ目ノイズを防ぐ
+			var e := 1.0
+			match env:
+				"decay": e = 1.0 - t
+				"attackdecay": e = sin(t * PI)
+			var v: float = _osc(wave, phase) * e * vol
+			var iv := int(clamp(v, -1.0, 1.0) * 32767.0)
+			data.append(iv & 0xff)
+			data.append((iv >> 8) & 0xff)
+	var stream := AudioStreamWAV.new()
+	stream.format = AudioStreamWAV.FORMAT_16_BITS
+	stream.mix_rate = SR
+	stream.stereo = false
+	stream.data = data
+	return stream
+
+
+## 使い捨て Player で再生し、終わったら自動破棄
+func _play(key: String, pitch := 1.0) -> void:
+	if not sfx.has(key):
+		return
+	var p := AudioStreamPlayer.new()
+	p.stream = sfx[key]
+	p.pitch_scale = pitch
+	add_child(p)
+	p.finished.connect(p.queue_free)
+	p.play()
